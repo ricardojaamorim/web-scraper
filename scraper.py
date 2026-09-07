@@ -42,8 +42,9 @@ USER_AGENT = "PriceTrackerBot/0.1 (personal project; contact: youremail@example.
 MIN_DELAY_SECONDS = 2.0  # minimum pause between requests — be polite
 DB_PATH = "prices.db"
 
-# Real selectors, derived from the full product card on pingodoce.pt
-# Structure observed (View Source prices are in the initial HTML, not JS):
+# ---- Real selectors, derived from the full product card on pingodoce.pt ----
+# Structure observed (View Source — prices ARE in the initial HTML, so
+# requests + BeautifulSoup is enough; no headless browser needed):
 #
 #   div.product-tile-pd  [data-pid, data-gtm-info='{...clean JSON...}']
 #     div.product-tile-image > a.product-tile-image-link[href]  -> product URL
@@ -121,6 +122,9 @@ class RateLimitedSession:
             response = self.session.get(url, timeout=15, **kwargs)
             self._last_request_time = time.monotonic()
             response.raise_for_status()
+            # Pingo Doce's pages are UTF-8, but don't always declare it clearly
+            # in headers
+            response.encoding = "utf-8"
             return response
         except requests.RequestException as e:
             print(f"  [error] fetching {url}: {e}")
@@ -283,7 +287,7 @@ def main():
     # Replace with real category/search URLs once you've inspected the site,
     # e.g. f"{BASE_URL}/pt/produtos/laticinios-e-ovos/leite/"
     category_urls = [
-        f"{BASE_URL}/pt/produtos/",
+        "https://www.pingodoce.pt/home/produtos/promocoes",
     ]
 
     total = 0
