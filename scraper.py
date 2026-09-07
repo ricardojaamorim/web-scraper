@@ -8,22 +8,6 @@ WHAT THIS DOES
   - Stores results in a local SQLite database with a price_history table,
     so re-running this daily builds up a price-over-time dataset.
 
-WHAT YOU NEED TO DO BEFORE RUNNING THIS FOR REAL
-  1. Open https://www.pingodoce.pt in a browser, open a product category or
-     search results page, and open dev tools (F12) -> Elements tab.
-  2. Find the actual CSS selectors for: product name, price, unit price,
-     brand, and product URL. Fill them into the PRODUCT_SELECTORS dict below.
-  3. Check whether prices appear in the initial HTML (view-source:) or only
-     after JavaScript runs. If only after JS, `requests` won't see them and
-     you'll need Playwright instead (see the playwright_variant.py note at
-     the bottom of this file).
-  4. Re-read pingodoce.pt/robots.txt yourself and adjust ALLOWED/DISALLOWED
-     assumptions if needed — this script checks it programmatically at
-     runtime, but you should sanity-check it as a human too.
-
-This script deliberately does NOT attempt to solve CAPTCHAs or bypass bot
-detection (e.g. Cloudflare challenges). If the site blocks you, that's a
-signal to slow down or stop, not to work around it.
 """
 
 import json
@@ -61,7 +45,6 @@ DB_PATH = "prices.db"
 # The data-gtm-info attribute holds an analytics JSON blob with already-clean
 # fields (item_id, item_name, item_brand, item_category, price). We use it as
 # the primary source and fall back to the visible DOM where needed.
-
 PRODUCT_SELECTORS = {
     "product_card": "div.product-tile-pd",
     "name": "div.product-name-link",
@@ -178,9 +161,6 @@ def price_from_value_span(card, selector: str) -> float | None:
 
 def parse_product_listing(html: str, page_url: str) -> list[Product]:
     """Parses a category/search page into a list of Product records.
-
-    This is the part you MUST adapt to the real site structure —
-    the selectors above are placeholders.
     """
     soup = BeautifulSoup(html, "html.parser")
     products = []
@@ -267,16 +247,54 @@ def save_products(conn: sqlite3.Connection, products: list[Product]) -> None:
     conn.commit()
 
 
-def scrape_category(session: RateLimitedSession, robots: RobotsChecker, category_url: str) -> list[Product]:
-    if not robots.can_fetch(category_url):
-        print(f"  [skip] robots.txt disallows: {category_url}")
-        return []
+def build_grid_url(cgid: str, start: int, page_size: int, extra_params: dict | None = None) -> str:
+    """Builds a Search-UpdateGrid URL — the same endpoint the 'Ver mais' button
+    calls under the hood. This is what lets us page through a whole category
+    without clicking anything or scrolling: we just increment `start`.
+    """
+    params = {"cgid": cgid, "start": start, "sz": page_size}
+    if extra_params:
+        params.update(extra_params)
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{BASE_URL}/on/demandware.store/Sites-pingo-doce-Site/default/Search-UpdateGrid?{query}"
 
-    response = session.get(category_url)
-    if response is None:
-        return []
 
-    return parse_product_listing(response.text, category_url)
+def scrape_category(
+    session: RateLimitedSession,
+    robots: RobotsChecker,
+    cgid: str,
+    page_size: int = 14,
+    max_pages: int = 50,
+    extra_params: dict | None = None,
+) -> list[Product]:
+    """Pages through an entire category using the same 'start'/'sz' pattern
+    as the site's own button, stopping when a page returns no
+    products (or after max_pages, as a safety net against an infinite loop
+    if the site's response format ever changes unexpectedly).
+    """
+    all_products: list[Product] = []
+
+    for page_num in range(max_pages):
+        start = page_num * page_size
+        url = build_grid_url(cgid, start, page_size, extra_params)
+
+        if not robots.can_fetch(url):
+            print(f"  [skip] robots.txt disallows: {url}")
+            break
+
+        response = session.get(url)
+        if response is None:
+            break  # network/HTTP error — stop rather than retry forever
+
+        products = parse_product_listing(response.text, url)
+        if not products:
+            print(f"  [done] page {page_num} returned 0 products — end of category")
+            break
+
+        print(f"  [page {page_num}] start={start} -> {len(products)} products")
+        all_products.extend(products)
+
+    return all_products
 
 
 def main():
@@ -284,19 +302,29 @@ def main():
     session = RateLimitedSession(USER_AGENT, delay=max(robots.crawl_delay, MIN_DELAY_SECONDS))
     conn = init_db(DB_PATH)
 
-    # Replace with real category/search URLs once you've inspected the site,
-    # e.g. f"{BASE_URL}/pt/produtos/laticinios-e-ovos/leite/"
-    category_urls = [
-        "https://www.pingodoce.pt/home/produtos/promocoes",
+    # Each entry is a category's cgid
+    categories = [
+        {"cgid": "ec_promos_1100000", "extra_params": {"pmin": "0.04"}},
+        {"cgid" : "ec_frutasevegetais_100", "extra_params": {"pmin": "0.04"}},
+        {"cgid" : "ec_talho_200", "extra_params": {"pmin": "0.04"}},
+        {"cgid" : "ec_peixaria_300", "extra_params": {"pmin": "0.04"}},
+        {"cgid" : "ec_padariaepastelaria_400", "extra_params": {"pmin": "0.04"}},
+        {"cgid" : "ec_charcutariaqueijos_500", "extra_params": {"pmin": "0.04"}},
+
     ]
+    
 
     total = 0
-    for url in category_urls:
-        print(f"Scraping: {url}")
-        products = scrape_category(session, robots, url)
+    for cat in categories:
+        cgid = cat["cgid"]
+        print(f"Scraping category: {cgid}")
+        products = scrape_category(
+            session, robots, cgid,
+            extra_params=cat.get("extra_params"),
+        )
         save_products(conn, products)
         total += len(products)
-        print(f"  -> {len(products)} products saved")
+        print(f"  -> {len(products)} total products saved for {cgid}")
 
     print(f"Done. {total} product rows saved to {DB_PATH}")
     conn.close()
